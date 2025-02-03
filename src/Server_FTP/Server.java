@@ -3,155 +3,165 @@ package Server_FTP;
 import java.io.*;
 import java.net.*;
 import java.util.*;
-import java.nio.file.*;
-import java.util.stream.*;
 
 public class Server {
 
-	public static final Map<String, String> users = new HashMap<>();
+    private static final String USERNAME = "miage";
+    private static final String PASSWORD = "car";
 
-    static {
-        users.put("miage", "car");
+    public static void main(String[] args) throws IOException {
+    	
+        int port = 2121;
+        ServerSocket serverSocket = new ServerSocket(port);
+        System.out.println("Serveur prêt à accepter des connexions sur le port " + port);
+
+        while (true) {
+            Socket clientSocket = serverSocket.accept();
+            new FTPClientHandler(clientSocket).start();
+        }
     }
 
-    public static void main(String[] args) {
+    private static class FTPClientHandler extends Thread {
     	
-        int port = 2121; // Port FTP standard 
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
-            System.out.println("Serveur prêt à accepter des connexions sur le port " + port);
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                System.out.println("Client connecte : " + clientSocket.getInetAddress());
-                new Thread(new ClientHandler(clientSocket, users)).start(); // Passe users ici
+        private Socket clientSocket;
+        private String currentDirectory = System.getProperty("user.dir");
+        private boolean authenticated = false;
+        private String clientUsername = null;
+
+        public FTPClientHandler(Socket socket) {
+            this.clientSocket = socket;
+        }
+
+        @Override
+        public void run() {
+            try (
+                InputStream inputStream = clientSocket.getInputStream();
+                OutputStream outputStream = clientSocket.getOutputStream();
+                Scanner inputScanner = new Scanner(inputStream);
+                PrintWriter outputWriter = new PrintWriter(outputStream, true)
+            ) {
+                outputWriter.println("220 Service ready");
+
+                while (inputScanner.hasNextLine()) {
+                    String clientMessage = inputScanner.nextLine().trim();
+                    String command = extractCommand(clientMessage);
+
+                    switch (command) {
+                        case "USER":
+                            System.out.println("USER " + clientMessage.substring(5).trim());
+                            String username = clientMessage.substring(5).trim();
+                            if (USERNAME.equals(username)) {
+                                clientUsername = username;
+                                outputWriter.println("331 Username accepted. Enter password :");
+                            } else {
+                                outputWriter.println("430 Invalid username.");
+                            }
+                            break;
+
+                        case "PASS":
+                            System.out.println("PASS " + clientMessage.substring(5).trim());
+                            String password = clientMessage.substring(5).trim();
+                            if (PASSWORD.equals(password) && USERNAME.equals(clientUsername)) {
+                                authenticated = true;
+                                outputWriter.println("230 User authenticated.");
+                            } else {
+                                outputWriter.println("430 Invalid password.");
+                            }
+                            break;
+
+                        case "QUIT":
+                            System.out.println("Client disconnected.");
+                            outputWriter.println("221 Disconnected from server.");
+                            clientSocket.close();
+                            return;
+
+                        default:
+                            if (!authenticated) {
+                                outputWriter.println("530 Not logged in.");
+                                break;
+                            }
+                            switch (command) {
+                                case "RETR":
+                                    System.out.println("RETR " + clientMessage.substring(5).trim());
+                                    String fileName = clientMessage.substring(5).trim();
+                                    File file = new File(currentDirectory, fileName);
+                                    if (!file.exists() || !file.isFile()) {
+                                        outputWriter.println("550 File not found.");
+                                        break;
+                                    }
+                                    try (ServerSocket dataSocket = new ServerSocket(0)) {
+                                        int dataPort = dataSocket.getLocalPort();
+                                        String dataIp = InetAddress.getLocalHost().getHostAddress();
+                                        outputWriter.println("227 Entering Passive Mode (" + dataIp.replace(".", ",") + "," + dataPort + ")");
+
+                                        try (Socket dataConnection = dataSocket.accept();
+                                             InputStream fileInput = new FileInputStream(file);
+                                             OutputStream dataOutput = dataConnection.getOutputStream()) {
+                                            outputWriter.println("150 Opening data connection.");
+                                            byte[] buffer = new byte[4096];
+                                            int bytesRead;
+                                            while ((bytesRead = fileInput.read(buffer)) != -1) {
+                                                dataOutput.write(buffer, 0, bytesRead);
+                                            }
+                                            outputWriter.println("226 Transfer complete.");
+                                        }
+                                    } catch (IOException e) {
+                                        outputWriter.println("550 Error transferring file.");
+                                    }
+                                    break;
+
+                                case "CWD":
+                                    System.out.println("CWD " + clientMessage.substring(4).trim());
+                                    String dir = clientMessage.substring(4).trim();
+                                    File newDir = new File(dir);
+                                    if (newDir.exists() && newDir.isDirectory()) {
+                                        currentDirectory = dir;
+                                        outputWriter.println("250 Directory changed successfully.");
+                                    } else {
+                                        outputWriter.println("550 Invalid directory.");
+                                    }
+                                    break;
+
+                                case "LIST":
+                                    System.out.println("LIST " + clientMessage);
+                                    File directory = new File(currentDirectory);
+                                    File[] files = directory.listFiles();
+                                    if (files == null || files.length == 0) {
+                                        outputWriter.println("550 No files to list.");
+                                        break;
+                                    }
+                                    try (ServerSocket dataSocket = new ServerSocket(0)) {
+                                        int dataPort = dataSocket.getLocalPort();
+                                        String dataIp = InetAddress.getLocalHost().getHostAddress();
+                                        outputWriter.println("227 Entering Passive Mode (" + dataIp.replace(".", ",") + "," + dataPort + ")");
+
+                                        try (Socket dataConnection = dataSocket.accept();
+                                             PrintWriter dataWriter = new PrintWriter(dataConnection.getOutputStream(), true)) {
+                                            outputWriter.println("150 Listing directory.");
+                                            for (File fileItem : files) {
+                                                String type = fileItem.isDirectory() ? "d" : "-";
+                                                dataWriter.println(type + " " + fileItem.getName());
+                                            }
+                                            outputWriter.println("226 Directory listing complete.");
+                                        }
+                                    } catch (IOException e) {
+                                        outputWriter.println("550 Error listing directory.");
+                                    }
+                                    break;
+
+                                default:
+                                    outputWriter.println("502 Command not implemented.");
+                            }
+                    }
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
-        } catch (IOException e) {
-            e.printStackTrace();
+        }
+
+        private String extractCommand(String message) {
+            int spaceIndex = message.indexOf(' ');
+            return (spaceIndex == -1) ? message.toUpperCase() : message.substring(0, spaceIndex).toUpperCase();
         }
     }
 }
-
-class ClientHandler implements Runnable {
-	
-	    private Socket clientSocket;
-	    private boolean authenticated = false;
-	    private Map<String, String> users; 
-	    
-	    public ClientHandler(Socket clientSocket, Map<String, String> users) {
-	        this.clientSocket = clientSocket;
-	        this.users = users;
-	    }
-	    
-	    @Override
-	    public void run() {
-	        try (
-	            InputStream input = clientSocket.getInputStream();
-	            OutputStream output = clientSocket.getOutputStream();
-	            BufferedReader reader = new BufferedReader(new InputStreamReader(input));
-	            PrintWriter writer = new PrintWriter(output, true)
-	        ) {
-	        	
-	            writer.println("220 Service ready");
-	            String username = null;
-	            while (true) {
-	                String command = reader.readLine();
-	                if (command == null) break;
-	                
-	                               
-	                String[] parts = command.split(" ", 2);
-	                String commandName = parts[0].toUpperCase();
-	                
-	                // Ignore la commande OPTS et continue
-	                 if (commandName.equals("OPTS")) {
-	                    writer.println("200 OPTS command ignored");
-	                    continue; 
-	                }
-	         
-	                String argument = parts.length > 1 ? parts[1] : "";
-	                
-	                switch (commandName) {
-	                
-	                    case "USER":
-	                        if (users.containsKey(argument)) {
-	                            username = argument;
-	                            System.out.println("USER " + argument);
-	                            writer.println("331 User name ok, need password");
-	                        } else {
-	                            writer.println("530 Unknown user");
-	                        }
-	                        break;
-	                        
-	                    case "PASS":
-	                        if (username != null && users.get(username).equals(argument)) {
-	                        	System.out.println("PASS " + argument);
-	                            writer.println("230 User logged in ");
-	                            authenticated = true;
-	                        } else {
-	                            writer.println("530 Authentication failed, please verify your credentials");
-	                        }
-	                        break;
-
-	                    case "QUIT":
-	                        writer.println("221 Logout");
-	                        System.out.println("QUIT");
-	                        clientSocket.close();
-	                        return;
-	                    	                        
-	                    case "EPRT":
-	                        writer.println("200 EPRT command ignored"); 
-	                        break;
-
-	                    case "LIST":
-	                        if (authenticated) {
-	                            // Mode passif configuré
-	                            writer.println("229 Entering Extended Passive Mode (|||"+clientSocket.getLocalPort()+"|)");
-
-	                            // Répertoire actuel
-	                            Path currentDir = Paths.get("C:\\Users\\user\\Documents\\2024-2025\\MIAGE M1\\Semestre 2\\BCC 2 - Génie Logiciel\\[24-25] CAR\\TP1_CAR\\src\\Server_FTP\\shared");
-	                            try (DirectoryStream<Path> directoryStream = Files.newDirectoryStream(currentDir)) {
-	                                writer.println("150 Accepted data connection");
-
-	                                // Parcours des fichiers et envoi au client 
-	                                for (Path path : directoryStream) {
-	                                    File file = path.toFile();
-	                                    String type = file.isDirectory() ? "d" : "-"; 
-	                                    String permissions = type + "rw-r--r--"; 
-
-	                                    long size = file.length(); 
-	                                    String name = file.getName(); 
-
-	                                    
-	                                    writer.printf("%s %d %s%n", permissions, size, name); 
-	                                    
-	                                }
-	                                
-	                                System.out.printf("LIST\n"); 
-
-	                                // Indiquer la fin de la liste
-	                                writer.println("");
-	                                writer.println("226 List transferred");
-	                            } catch (IOException e) {
-	                                writer.println("450 Requested file action not taken");
-	                            }
-	                        } else {
-	                            writer.println("530 Please log in first");
-	                        }
-	                        break;
-
-
-                   	                        
-	                    default:
-	                        writer.println("500 Unknown command : " + commandName);
-	                        break;
-	                }
-	            }
-	        } catch (IOException e) {
-	            System.out.println("The client has disconnected.");
-	        } finally {
-	            try {
-	                clientSocket.close();
-	            } catch (IOException e) {
-	                e.printStackTrace();
-	            }
-	        }              
-	    }
-	}
